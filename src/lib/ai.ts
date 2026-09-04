@@ -51,7 +51,7 @@ Do NOT introduce yourself again and do NOT repeat the service list — continue 
       Authorization: `Bearer ${OPENROUTER_API_KEY}`,
       "Content-Type": "application/json",
       "HTTP-Referer": "https://swayaan.com",
-      "X-Title": "Swayaan WhatsApp AI Agent",
+      "X-Title": "Invoice Intake WhatsApp AI Agent",
     },
     body: JSON.stringify({
       model: MODEL,
