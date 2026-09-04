@@ -192,59 +192,22 @@ function getExtension(
 }
 
 /*
- * Media categories that are actually saved to disk. This is an
- * invoice/receipt intake system: we only keep photos and documents
- * (the things that can actually be a receipt/invoice). Audio,
- * video, stickers, and links are never written to local storage.
+ * Local disk folder name per media category. Kept separate from
+ * getBucketName() (Supabase bucket names) since the local layout is
+ * organized conversation-first, not type-first.
  */
-const SAVED_CATEGORIES: MediaCategory[] = ["image", "document"];
-
-function isSavableCategory(
+function getLocalCategoryFolder(
   category: MediaCategory
-): boolean {
-  return SAVED_CATEGORIES.includes(category);
-}
-
-/*
- * YYYY-MM-DD for the receipt filename, derived from the WhatsApp
- * message timestamp (unix seconds, as a string). Falls back to
- * "now" if the timestamp is missing/unparseable — a save should
- * never fail just because of a bad date.
- */
-function formatReceiptDate(timestamp: string | null): string {
-  const seconds = Number(timestamp);
-
-  const date =
-    timestamp && !Number.isNaN(seconds)
-      ? new Date(seconds * 1000)
-      : new Date();
-
-  return date.toISOString().slice(0, 10);
-}
-
-/*
- * Filesystem-safe version of a wamid — these are base64-ish and can
- * contain characters (e.g. "=") that are fine on Linux/macOS but
- * best avoided for portability. Anything outside letters/digits/dot/
- * dash/underscore becomes "_".
- */
-function sanitizeForFilename(value: string): string {
-  return value.replace(/[^A-Za-z0-9._-]/g, "_");
-}
-
-/*
- * Receipt filename: <date>-<wamid>.<extension>
- * e.g. 2026-09-03-wamid.HBgM...A.jpg
- */
-function buildReceiptFilename(
-  timestamp: string | null,
-  whatsappMsgId: string,
-  extension: string
 ): string {
-  const date = formatReceiptDate(timestamp);
-  const safeId = sanitizeForFilename(whatsappMsgId);
+  const map: Partial<Record<MediaCategory, string>> = {
+    image: "images",
+    video: "videos",
+    audio: "audio",
+    document: "documents",
+    link: "documents",
+  };
 
-  return `${date}-${safeId}.${extension}`;
+  return map[category] ?? "documents";
 }
 
 /*
@@ -278,36 +241,31 @@ async function getLocalUploadsRoot(
 }
 
 /*
- * Save a downloaded media buffer to the local filesystem, organized:
- *
- *   {uploadsRoot}/conversations/{conversationNumber}/receipts/{filename}
- *
- * Every conversation gets one "receipts" folder — photos and
- * documents are saved together there (no per-type subfolders
- * anymore). filename is expected to already be in the
- * <date>-<wamid>.<ext> shape from buildReceiptFilename().
+ * Save a downloaded media buffer to the local filesystem, organized
+ * conversation-first: {uploadsRoot}/{phone}/{category}/{filename}
  *
  * uploadsRoot comes from getLocalUploadsRoot() above, so it reflects
  * whatever path the developer set in the Settings UI — not a
  * hardcoded value.
  *
- * The conversation folder is created only once per conversation —
- * fs.mkdir(..., { recursive: true }) is a safe no-op if it already
- * exists, it never recreates or errors. Never throws — a local save
- * failure should not break the rest of the message flow.
+ * The conversation folder ({uploadsRoot}/{phone}) is created only
+ * once per conversation — fs.mkdir(..., { recursive: true }) is a
+ * safe no-op if it already exists, it never recreates or errors.
+ * Never throws — a local save failure should not break the rest of
+ * the message flow.
  */
 async function saveMediaLocally(
   buffer: Buffer,
   uploadsRoot: string,
-  conversationNumber: string,
+  phone: string,
+  category: MediaCategory,
   filename: string
 ): Promise<string | null> {
   try {
     const destPath = path.join(
       uploadsRoot,
-      "conversations",
-      conversationNumber,
-      "receipts",
+      phone,
+      getLocalCategoryFolder(category),
       filename
     );
 
@@ -423,17 +381,6 @@ export async function uploadMediaToStorage(
     };
   }
 
-  // Receipt intake only cares about photos and documents. Video,
-  // audio, and stickers are recognized/stored as messages (see the
-  // webhook), but we never download or save their bytes to disk.
-  if (!isSavableCategory(mediaCategory)) {
-    return {
-      mediaUrl: null,
-      mediaCategory,
-      localPath: null,
-    };
-  }
-
   // Download media from Meta
   const downloaded = await downloadWhatsAppMedia(
     incoming.mediaId
@@ -451,54 +398,43 @@ export async function uploadMediaToStorage(
 
   const category = getMediaCategory(mimeType);
 
-  // Re-check against the real downloaded mime type, in case it
-  // differs from what the webhook payload claimed.
-  if (!isSavableCategory(category)) {
-    return {
-      mediaUrl: null,
-      mediaCategory: category,
-      localPath: null,
-    };
-  }
-
   const extension = getExtension(
     mimeType,
     incoming.filename
   );
 
-  // <date>-<wamid>.<ext> — all receipts for a conversation land
-  // together in one "receipts" folder, see saveMediaLocally.
-  const localFilename = buildReceiptFilename(
-    incoming.timestamp,
-    incoming.whatsappMsgId,
-    extension
-  );
+  // Local filename only — the phone number becomes the conversation
+  // folder, see saveMediaLocally.
+  const localFilename = incoming.filename
+    ? `${incoming.whatsappMsgId}_${incoming.filename}`
+    : `${incoming.whatsappMsgId}.${extension}`;
 
-  // Save the actual bytes locally, organized:
-  // {uploadsRoot}/conversations/{phone}/receipts/{date-wamid.ext}.
-  // This reuses the buffer we already downloaded above — no second
-  // fetch from Meta. We no longer upload the file itself to
-  // Supabase Storage — only the local path is kept, and that path is
-  // what gets written into the `messages.media_url` column in
-  // Supabase (Postgres), so Supabase still holds the reference even
-  // though the file lives on disk. uploadsRoot comes from the
-  // developer's Settings UI, not a hardcoded path.
+  // Save the actual bytes locally, organized conversation-first:
+  // {uploadsRoot}/{phone}/{category}/{filename}. This reuses the
+  // buffer we already downloaded above — no second fetch from Meta.
+  // We no longer upload the file itself to Supabase Storage — only
+  // the local path is kept, and that path is what gets written into
+  // the `messages.media_url` column in Supabase (Postgres), so
+  // Supabase still holds the reference even though the file lives on
+  // disk. uploadsRoot comes from the developer's Settings UI, not a
+  // hardcoded path.
   const uploadsRoot = await getLocalUploadsRoot(supabase);
 
   const localPath = await saveMediaLocally(
     buffer,
     uploadsRoot,
     incoming.from,
+    category,
     localFilename
   );
 
   if (localPath) {
     console.log(
-      `✅ Receipt saved locally: ${localPath}`
+      `✅ Media saved locally: ${localPath}`
     );
   } else {
     console.error(
-      "❌ Local receipt save failed"
+      "❌ Local media save failed"
     );
   }
 
@@ -506,142 +442,6 @@ export async function uploadMediaToStorage(
     mediaUrl: localPath,
     mediaCategory: category,
     localPath,
-  };
-}
-
-/*
- * Upload a local file's bytes to Meta's media endpoint so it can be
- * attached to an outgoing message. Returns the media id Meta hands
- * back, or null on failure. This is a resumable-upload-free "simple
- * upload" — fine for the report sizes this app deals with (well
- * under Meta's 100MB document cap).
- */
-export async function uploadMediaToWhatsApp(
-  buffer: Buffer,
-  mimeType: string,
-  filename: string
-): Promise<string | null> {
-  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
-  const accessToken = process.env.WHATSAPP_ACCESS_TOKEN;
-
-  if (!phoneNumberId || !accessToken) {
-    throw new Error(
-      "Missing WHATSAPP_PHONE_NUMBER_ID or WHATSAPP_ACCESS_TOKEN env vars"
-    );
-  }
-
-  try {
-    const form = new FormData();
-
-    form.append("messaging_product", "whatsapp");
-    form.append(
-      "file",
-      new Blob([new Uint8Array(buffer)], { type: mimeType }),
-      filename
-    );
-
-    const res = await fetch(
-      `https://graph.facebook.com/${GRAPH_VERSION}/${phoneNumberId}/media`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-        },
-        body: form,
-      }
-    );
-
-    const data = await res.json().catch(() => null);
-
-    if (!res.ok || !data?.id) {
-      console.error(
-        "uploadMediaToWhatsApp failed:",
-        res.status,
-        data
-      );
-
-      return null;
-    }
-
-    return data.id as string;
-  } catch (err) {
-    console.error("uploadMediaToWhatsApp error:", err);
-
-    return null;
-  }
-}
-
-/*
- * Send a document (report file) to a WhatsApp number: uploads the
- * bytes to Meta, then sends a "document" type message referencing
- * the returned media id. caption shows up under the file preview in
- * WhatsApp — handy for a one-line "Weekly report — 1-7 Sep" note.
- */
-export async function sendWhatsAppDocument(
-  to: string,
-  buffer: Buffer,
-  mimeType: string,
-  filename: string,
-  caption?: string
-): Promise<WhatsAppSendResult> {
-  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
-  const accessToken = process.env.WHATSAPP_ACCESS_TOKEN;
-
-  if (!phoneNumberId || !accessToken) {
-    throw new Error(
-      "Missing WHATSAPP_PHONE_NUMBER_ID or WHATSAPP_ACCESS_TOKEN env vars"
-    );
-  }
-
-  const mediaId = await uploadMediaToWhatsApp(
-    buffer,
-    mimeType,
-    filename
-  );
-
-  if (!mediaId) {
-    return {
-      ok: false,
-      status: 502,
-      body: { error: "Failed to upload document to WhatsApp media" },
-    };
-  }
-
-  const res = await fetch(
-    `https://graph.facebook.com/${GRAPH_VERSION}/${phoneNumberId}/messages`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        messaging_product: "whatsapp",
-        to,
-        type: "document",
-        document: {
-          id: mediaId,
-          filename,
-          ...(caption ? { caption } : {}),
-        },
-      }),
-    }
-  );
-
-  const responseBody = await res.json().catch(() => null);
-
-  if (!res.ok) {
-    console.error(
-      "sendWhatsAppDocument send failed",
-      res.status,
-      responseBody
-    );
-  }
-
-  return {
-    ok: res.ok,
-    status: res.status,
-    body: responseBody,
   };
 }
 
@@ -799,9 +599,42 @@ export function parseIncomingMessage(
   }
 }
 
-// NOTE: Links are intentionally not saved to local storage anymore.
-// This is a receipts/invoice intake system — only photos and
-// documents are persisted to disk (see isSavableCategory above).
-// Incoming URLs are still detected in the webhook for informational
-// purposes (stored as `link_url` on the message row), but no file is
-// written for them.
+export async function uploadLinkToStorage(
+  supabase: any,
+  incoming: IncomingMessage,
+  url: string
+): Promise<string | null> {
+  try {
+    // Saved locally as {uploadsRoot}/{phone}/documents/{whatsappMsgId}.txt
+    // — same conversation-first layout as media, using the
+    // developer-configured path. No Supabase Storage bucket
+    // involved; the returned local path is what gets written into
+    // `messages.media_url` in Supabase (Postgres).
+    const localFilename = `${incoming.whatsappMsgId}.txt`;
+
+    const uploadsRoot = await getLocalUploadsRoot(supabase);
+
+    const localPath = await saveMediaLocally(
+      Buffer.from(url, "utf-8"),
+      uploadsRoot,
+      incoming.from,
+      "link",
+      localFilename
+    );
+
+    if (localPath) {
+      console.log(
+        `✅ Link saved locally: ${localPath}`
+      );
+    } else {
+      console.error(
+        "❌ Local link save failed"
+      );
+    }
+
+    return localPath;
+  } catch (error) {
+    console.error("uploadLinkToStorage error:", error);
+    return null;
+  }
+}

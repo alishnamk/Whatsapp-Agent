@@ -10,8 +10,6 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.4",
-    "form-data": "^4.0.6",
-    "inngest": "^4.18.1",
     "next": "^16.3.2",
     "openai": "^4.68.0",
     "react": "^18.3.1",

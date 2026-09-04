@@ -6,6 +6,7 @@ import {
   parseIncomingMessage,
   sendWhatsAppMessage,
   uploadMediaToStorage,
+  uploadLinkToStorage,
   getMediaCategory,
 } from "@/lib/whatsapp";
 
@@ -15,15 +16,15 @@ import {
 } from "@/lib/ai";
 
 const MAX_HISTORY_MESSAGES = 20;
-const SESSION_IDLE_MS = 2 * 60 * 60 * 1000;
+const SESSION_IDLE_MS = 6 * 60 * 60 * 1000;
 
 const OPENING_PATTERNS = [
   /^(hi+|hey+|hello+|yo|hii+|helo+|namaste|namaskar|hola|start|menu)\b/,
   /^good\s+(morning|afternoon|evening|day)\b/,
   /^(who|what)\s+(are|is)\s+(you|this)\b/,
-  /\bwhat\s+(do|does)\s+you\s+do\b/,
-  /\btell\s+me\s+about\s+(you|this)\b/,
-  /\bhow\s+(do|does)\s+this\s+work\b/,
+  /\bwhat\s+(do|does)\s+(you|swayaan|your\s+company)\s+do\b/,
+  /\btell\s+me\s+about\s+(you|your\s+company|swayaan|your\s+services)\b/,
+  /\b(your|the)\s+services\b/,
 ];
 
 // Detect URLs in plain text messages
@@ -179,10 +180,10 @@ async function handleIncomingMessage(
 
   let extractedUrls: string[] = [];
 
+  let linkStorageUrl: string | null = null;
+
   // ---------------------------------------------------------
-  // 2A. Detect URLs (metadata only — links are never saved to
-  // disk; this is a receipts/invoice intake system and only
-  // photos/documents get written to local storage, see 2B).
+  // 2A. Detect and store URLs
   // ---------------------------------------------------------
 
   if (
@@ -195,12 +196,28 @@ async function handleIncomingMessage(
 
     if (extractedUrls.length > 0) {
       mediaCategory = "link" as typeof mediaCategory;
+
+      linkStorageUrl =
+        await uploadLinkToStorage(
+          supabase,
+          incoming,
+          extractedUrls[0]
+        );
+
+      if (linkStorageUrl) {
+        console.log(
+          `✅ Link stored in Supabase Storage: ${linkStorageUrl}`
+        );
+      } else {
+        console.error(
+          "❌ Link storage upload failed"
+        );
+      }
     }
   }
 
   // ---------------------------------------------------------
-  // 2B. Download and save receipts (photos/documents only) —
-  // uploadMediaToStorage() itself skips audio/video/stickers.
+  // 2B. Download and upload WhatsApp media
   // ---------------------------------------------------------
 
   if (
@@ -225,11 +242,11 @@ async function handleIncomingMessage(
 
     if (mediaUrl) {
       console.log(
-        `✅ Receipt saved locally: ${mediaUrl}`
+        `✅ Media uploaded to Supabase Storage: ${mediaUrl}`
       );
     } else {
-      console.log(
-        `ℹ️ No local file saved for this ${incoming.type} message (only photos/documents are stored as receipts) — metadata only`
+      console.error(
+        "❌ Media upload failed — storing metadata only"
       );
     }
   }
@@ -274,11 +291,9 @@ async function handleIncomingMessage(
       media_sha256:
         incoming.sha256,
 
-      // Local receipt file path (photos/documents only — see
-      // uploadMediaToStorage). null for text, links, audio, video,
-      // and stickers.
+      // Uploaded media or uploaded link
       media_url:
-        mediaUrl,
+        mediaUrl ?? linkStorageUrl,
 
       // Original URL
       link_url:
@@ -320,44 +335,33 @@ async function handleIncomingMessage(
     );
 
     if (conversation.mode === "agent") {
-      // Only photos and documents are actually saved as receipts
-      // (see uploadMediaToStorage) — the acknowledgment reflects
-      // that: a confirmation when it was saved, or a plain "not
-      // accepted, please resend" when it wasn't (audio/video/
-      // stickers).
       const ackMessages: Record<
         string,
         string
       > = {
-        image: mediaUrl
-          ? "🧾 Receipt received, thank you!"
-          : "We couldn't save that image. Please resend it as a clear photo of the receipt/invoice.",
-
-        document: mediaUrl
-          ? `🧾 Receipt received${
-              incoming.filename
-                ? ` (${incoming.filename})`
-                : ""
-            }, thank you!`
-          : `We couldn't save that document${
-              incoming.filename
-                ? ` (${incoming.filename})`
-                : ""
-            }. Please resend it as a photo or a document (e.g. PDF).`,
+        image:
+          "📸 Image received! How can I help you today?",
 
         video:
-          "Videos aren't accepted here. Please send the receipt/invoice as a photo or a document instead.",
+          "🎥 Video received! How can I help you today?",
 
         audio:
-          "Voice/audio messages aren't accepted here. Please send the receipt/invoice as a photo or a document instead.",
+          "🎵 Audio received! How can I help you today?",
+
+        document:
+          `📄 Document received${
+            incoming.filename
+              ? ` (${incoming.filename})`
+              : ""
+          }! How can I help you today?`,
 
         sticker:
-          "Stickers aren't accepted here. Please send the receipt/invoice as a photo or a document instead.",
+          "😊 Got your sticker! How can I help you today?",
       };
 
       const ack =
         ackMessages[incoming.type] ??
-        "That wasn't accepted. Please send the receipt/invoice as a photo or a document.";
+        "Media received! How can I help you today?";
 
       await sendWhatsAppMessage(
         incoming.from,
